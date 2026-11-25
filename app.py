@@ -1,717 +1,430 @@
+import base64
+import hashlib
+import html
+from pathlib import Path
+import time
+
+import pandas as pd
 import streamlit as st
-import fitz  # PyMuPDF
-from transformers import pipeline
-from datetime import datetime
-from pdf2image import convert_from_bytes
-import pytesseract
-from PIL import Image
-import io
+
+from utils.evaluation import calculate_rouge
+from utils.pdf_extractor import extract_text_from_pdf
+from utils.pegasus import generate_pegasus_summary, load_pegasus_model
+from utils.report_builder import build_analysis_report, count_sentences
+from utils.section_detector import detect_sections, remove_references_section
+from utils.text_cleaner import clean_text
+from utils.textrank import generate_textrank_summary
 
 # Configure page settings
 st.set_page_config(
-    page_title="AI PDF Summarizer",
+    page_title="Scientific Research Paper Summarizer",
     page_icon="📄",
-    layout="wide"
+    layout="wide",
 )
 
-# Initialize session state for current date
-if 'current_date' not in st.session_state:
-    st.session_state.current_date = datetime.now().strftime("%B %d, %Y at %I:%M %p")
+MODEL_OPTIONS = {
+    "TextRank Only (Instant, 0 MB download)": "textrank",
+    "Falconsai/text_summarization (Fast AI, ~240 MB)": "Falconsai/text_summarization",
+    "google/pegasus-arxiv (Scientific, ~2.3 GB)": "google/pegasus-arxiv",
+    "google/pegasus-pubmed (Biomedical, ~2.3 GB)": "google/pegasus-pubmed",
+}
 
-# Load the summarization model with caching
-@st.cache_resource
-def load_summarizer(model_name="t5-small"):
-    return pipeline("summarization", model=model_name)
+SPEED_PROFILES = {
+    "Fast (Recommended: Greedy, max 8 chunks)": {"num_beams": 1, "max_chunks": 8},
+    "Balanced (2 beams, max 12 chunks)": {"num_beams": 2, "max_chunks": 12},
+    "Full Quality (4 beams, all chunks)": {"num_beams": 4, "max_chunks": None},
+}
 
-# Check if Tesseract is available
-@st.cache_data
-def check_tesseract():
-    try:
-        pytesseract.get_tesseract_version()
+
+def _is_model_cached_locally(model_id: str) -> bool:
+    if model_id == "textrank":
         return True
-    except Exception:
-        return False
+    cache_dir = Path.home() / ".cache" / "huggingface" / "hub" / f"models--{model_id.replace('/', '--')}"
+    return cache_dir.exists()
 
-# Text chunking function for large documents
-def chunk_text(text, chunk_size=1000):
-    """Break text into smaller chunks for processing"""
-    words = text.split()
-    chunks = []
-    current_chunk = []
-    current_length = 0
-    
-    for word in words:
-        word_length = len(word) + 1  # +1 for space
-        if current_length + word_length > chunk_size and current_chunk:
-            chunks.append(' '.join(current_chunk))
-            current_chunk = [word]
-            current_length = word_length
-        else:
-            current_chunk.append(word)
-            current_length += word_length
-    
-    if current_chunk:
-        chunks.append(' '.join(current_chunk))
-    
-    return chunks
 
-# Enhanced summarization for chunked text
-def summarize_chunked_text(text, summarizer, chunk_size=1000, detail_level="Detailed"):
-    """Summarize large text by processing it in chunks with enhanced detail preservation"""
-    if not text.strip():
-        return "No text available for summarization."
-    
-    chunks = chunk_text(text, chunk_size)
-    total_chunks = len(chunks)
-    
-    # Adjust parameters based on detail level and document size
-    if detail_level == "Brief":
-        max_per_chunk = 80
-        min_per_chunk = 20
-        final_max = 250
-    elif detail_level == "Detailed":
-        max_per_chunk = 150
-        min_per_chunk = 40
-        final_max = 400
-    else:  # Comprehensive
-        max_per_chunk = 200
-        min_per_chunk = 50
-        final_max = 600
-    
-    # For very large documents, preserve more detail
-    if total_chunks > 10:
-        max_per_chunk = int(max_per_chunk * 1.3)
-        final_max = int(final_max * 1.5)
-    
-    if len(chunks) == 1:
-        # Single chunk - direct summarization with enhanced length
-        try:
-            summary = summarizer(text, max_length=final_max, min_length=min_per_chunk * 2, do_sample=False)
-            return summary[0]['summary_text']
-        except Exception as e:
-            return f"Error generating summary: {str(e)}"
-    
-    # Multiple chunks - process each chunk with progress tracking
-    chunk_summaries = []
-    
-    for i, chunk in enumerate(chunks):
-        if len(chunk.strip()) < 30:  # Skip very short chunks
-            continue
-        try:
-            # Update progress if we have access to streamlit
-            if 'st' in globals():
-                progress = int(30 + (i / total_chunks) * 50)  # 30-80% progress range
-                st.session_state.get('progress_bar', lambda x: None)(progress)
-                st.session_state.get('status_text', lambda x: None)(f"🧩 Processing chunk {i+1}/{total_chunks}...")
-            
-            # Summarize each chunk with appropriate length
-            summary = summarizer(chunk, max_length=max_per_chunk, min_length=min_per_chunk, do_sample=False)
-            chunk_summaries.append(summary[0]['summary_text'])
-            
-        except Exception as e:
-            if 'st' in globals():
-                st.warning(f"Warning: Could not summarize chunk {i+1}: {str(e)}")
-            continue
-    
-    if not chunk_summaries:
-        return "Unable to generate summary from the provided text."
-    
-    # Combine all chunk summaries
-    combined_summary = " ".join(chunk_summaries)
-    
-    # Only compress if significantly too long, preserve more content
-    compression_threshold = final_max * 2  # More generous threshold
-    
-    if len(combined_summary) > compression_threshold:
-        try:
-            # Split into paragraphs for better compression
-            paragraphs = [s.strip() for s in combined_summary.split('.') if s.strip()]
-            
-            # Keep more important sentences (longer ones typically have more content)
-            important_sentences = sorted(paragraphs, key=len, reverse=True)
-            
-            # Take top sentences up to our limit
-            final_content = []
-            current_length = 0
-            
-            for sentence in important_sentences:
-                if current_length + len(sentence) < compression_threshold:
-                    final_content.append(sentence)
-                    current_length += len(sentence)
-                else:
-                    break
-            
-            # Reorder by original appearance for better flow
-            final_summary_text = '. '.join(final_content)
-            
-            # Final AI compression if still too long
-            if len(final_summary_text) > final_max:
-                final_summary = summarizer(final_summary_text, max_length=final_max, min_length=final_max//2, do_sample=False)
-                return final_summary[0]['summary_text']
-            
-            return final_summary_text
-            
-        except Exception as e:
-            if 'st' in globals():
-                st.warning(f"Final compression failed: {str(e)}")
-            return combined_summary
-    
-    return combined_summary
+@st.cache_resource
+def get_cached_model(model_id: str):
+    return load_pegasus_model(model_id)
 
-# Format summary into bullet points
-def format_summary_bullets(summary_text):
-    """Format summary text into clean bullet points with enhanced extraction"""
-    if not summary_text.strip():
-        return ["No summary content available"]
-    
-    # Multiple splitting strategies to capture more content
-    bullet_points = []
-    
-    # Strategy 1: Split by periods and common conjunctions
-    sentences = []
-    for delimiter in ['. ', '; ', ', and ', ', but ', ', however ', ', therefore ', ', furthermore ']:
-        if delimiter in summary_text:
-            parts = summary_text.split(delimiter)
-            sentences.extend([p.strip() for p in parts if p.strip()])
-            break
-    
-    # If no good splits found, split by periods only
-    if not sentences:
-        sentences = [s.strip() for s in summary_text.split('.') if s.strip()]
-    
-    # Strategy 2: Also look for natural breaks like "Additionally", "Moreover", etc.
-    enhanced_sentences = []
-    for sentence in sentences:
-        # Split on transition words that indicate new points
-        for transition in [' Additionally', ' Moreover', ' Furthermore', ' Also', ' In addition', ' Another']:
-            if transition in sentence:
-                parts = sentence.split(transition)
-                enhanced_sentences.extend([p.strip() for p in parts if p.strip()])
-                break
-        else:
-            enhanced_sentences.append(sentence)
-    
-    # Clean and filter sentences
-    for sentence in enhanced_sentences:
-        sentence = sentence.strip()
-        
-        # Skip very short phrases or incomplete thoughts
-        if len(sentence.split()) < 4:
-            continue
-            
-        # Clean up the sentence
-        # Remove leading conjunctions and transitions
-        for prefix in ['and ', 'but ', 'however ', 'therefore ', 'furthermore ', 'additionally ', 'moreover ', 'also ']:
-            if sentence.lower().startswith(prefix):
-                sentence = sentence[len(prefix):].strip()
-                break
-        
-        # Remove trailing period if exists
-        if sentence.endswith('.'):
-            sentence = sentence[:-1]
-        
-        # Ensure sentence starts with capital letter
-        if sentence and sentence[0].islower():
-            sentence = sentence[0].upper() + sentence[1:]
-        
-        # Only add if it's meaningful (has substance)
-        if len(sentence) > 10 and any(word in sentence.lower() for word in 
-                                     ['the', 'is', 'are', 'was', 'were', 'have', 'has', 'will', 'can', 'should']):
-            bullet_points.append(sentence)
-    
-    # If we still don't have enough points, try a different approach
-    if len(bullet_points) < 3:
-        # Split by commas for more granular points
-        comma_split = [s.strip() for s in summary_text.split(',') if len(s.strip().split()) >= 5]
-        for point in comma_split[:10]:  # Limit to prevent too many small points
-            if point not in bullet_points:
-                # Clean and format
-                point = point.strip()
-                if point.endswith('.'):
-                    point = point[:-1]
-                if point and point[0].islower():
-                    point = point[0].upper() + point[1:]
-                bullet_points.append(point)
-    
-    # Remove duplicates while preserving order
-    seen = set()
-    unique_points = []
-    for point in bullet_points:
-        # Simple similarity check - avoid very similar points
-        point_words = set(point.lower().split())
-        is_duplicate = False
-        for seen_point in seen:
-            seen_words = set(seen_point.lower().split())
-            if len(point_words.intersection(seen_words)) / max(len(point_words), len(seen_words)) > 0.7:
-                is_duplicate = True
-                break
-        
-        if not is_duplicate:
-            unique_points.append(point)
-            seen.add(point)
-    
-    return unique_points[:20]  # Limit to top 20 points to avoid overwhelming UI
 
-# Sidebar Panel
-st.sidebar.title("📄 AI PDF Summarizer")
-st.sidebar.markdown("Summarize PDF documents instantly using AI – upload, preview, and generate insights in seconds.")
+@st.cache_data(show_spinner=False)
+def process_pdf_cached(file_hash: str, pdf_bytes: bytes, max_pages: int | None):
+    raw_text, total_pages, ocr_used, error_msg = extract_text_from_pdf(
+        pdf_bytes, max_pages=max_pages
+    )
+    if error_msg or not raw_text.strip():
+        return raw_text, "", {}, total_pages, ocr_used, error_msg
+    cleaned = clean_text(raw_text)
+    sections = detect_sections(cleaned)
+    return raw_text, cleaned, sections, total_pages, ocr_used, None
+
+
+def _reset_summary_state():
+    for key in [
+        "summary_generated",
+        "textrank_summary",
+        "textrank_time",
+        "pegasus_summary",
+        "pegasus_time",
+        "section_summaries",
+        "device",
+        "last_model_label",
+        "rouge_scores_tr",
+        "rouge_scores_pg",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _direct_download_link(content: str, filename: str, label: str, mime: str = "text/plain") -> str:
+    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    safe_filename = html.escape(filename, quote=True)
+    safe_label = html.escape(label)
+    return (
+        f'<a href="data:{mime};charset=utf-8;base64,{b64}" '
+        f'download="{safe_filename}" '
+        f'style="display:inline-block;padding:0.45rem 0.9rem;border-radius:0.4rem;'
+        f'background:#0f62fe;color:#ffffff;text-decoration:none;font-weight:600;">'
+        f"⬇️ {safe_label}</a>"
+    )
+
+
+# Default to a cached neural model if present locally, otherwise Fast AI (~240 MB)
+default_index = 2 if _is_model_cached_locally("google/pegasus-arxiv") else 1
+
+# Sidebar
+st.sidebar.title("📄 Configuration")
+st.sidebar.markdown("Scientific Research Paper Summarizer")
 st.sidebar.markdown("---")
 
-# Model selection
-st.sidebar.markdown("### 🤖 AI Model Selection")
-model_choice = st.sidebar.selectbox(
+st.sidebar.markdown("### 🤖 Model Selection")
+model_label = st.sidebar.selectbox(
     "Choose Summarization Model:",
-    [
-        "t5-small",
-        "t5-base",
-        "t5-large",
-        "facebook/bart-large-cnn",
-        "sshleifer/distilbart-cnn-12-6",
-        "google/pegasus-xsum",
-        "philschmid/bart-large-cnn-samsum",
-        "google/pegasus-cnn_dailymail",
-        "google/pegasus-multi_news",
-        "google/pegasus-pubmed",
-        "google/pegasus-arxiv"
-    ],
-    help="Choose from a variety of top summarization models from Hugging Face. T5 and BART are general-purpose, Pegasus is state-of-the-art for news and scientific text."
+    list(MODEL_OPTIONS.keys()),
+    index=default_index,
+    help="Select TextRank for instant 0-MB summarization, Falconsai for fast low-data AI summarization, or PEGASUS for heavy scientific summarization.",
+)
+model_choice = MODEL_OPTIONS[model_label]
+
+if model_choice == "textrank":
+    st.sidebar.caption("⚡ Instant extractive mode (0 MB download).")
+elif _is_model_cached_locally(model_choice):
+    st.sidebar.caption("✅ Model cached locally (0 MB network download).")
+else:
+    st.sidebar.caption("⬇️ First run downloads weights once and caches them locally.")
+
+st.sidebar.markdown("### ⚡ Performance & Data")
+speed_label = st.sidebar.selectbox(
+    "Speed / Compute Profile:",
+    list(SPEED_PROFILES.keys()),
+    index=0,
+    help="Fast mode uses greedy decoding and limits chunks so long papers finish quickly.",
+)
+speed_cfg = SPEED_PROFILES[speed_label]
+exclude_references = st.sidebar.checkbox(
+    "Exclude References / Bibliography",
+    value=True,
+    help="Skips trailing References/Bibliography sections, saving ~25–40% runtime.",
+)
+max_pages_limit = st.sidebar.number_input(
+    "Max pages to extract (0 = all):",
+    min_value=0,
+    max_value=500,
+    value=0,
+    step=5,
+    help="Limit pages extracted for very large PDFs/books.",
 )
 
-# Warn users if a large model is selected (may crash on limited hardware)
-large_models = [
-    "t5-large",
-    "facebook/bart-large-cnn",
-    "google/pegasus-arxiv",
-    "google/pegasus-pubmed",
-    "google/pegasus-multi_news"
-]
-if model_choice in large_models:
-    st.sidebar.warning(
-        "⚠️ Large models may require more memory than available on free Streamlit Cloud or small servers. "
-        "If the app crashes or restarts, try a smaller model like 't5-small' or 'distilbart-cnn-12-6'."
-    )
+st.sidebar.markdown("### ⚙️ TextRank Baseline")
+num_sentences = st.sidebar.slider("Number of sentences:", min_value=1, max_value=30, value=10)
 
-# Summarization mode selection
-st.sidebar.markdown("### 🛠️ Summarization Mode")
-summarization_mode = st.sidebar.radio(
-    "Choose how to summarize:",
-    ["Built-in (local)", "External API"],
-    help="Use the app's built-in summarizer or send your PDF to a public summarization API."
+st.sidebar.markdown("### ⚙️ AI Summary Length")
+pegasus_max_length = st.sidebar.slider("Max length per chunk:", min_value=80, max_value=500, value=220)
+pegasus_min_length = st.sidebar.slider("Min length per chunk:", min_value=20, max_value=200, value=40)
+
+st.sidebar.markdown("### 📋 Features")
+enable_section_wise = st.sidebar.checkbox(
+    "Enable Section-wise Summary (slower)",
+    value=False,
+    help="Runs an extra AI summarization pass per detected section.",
 )
-external_api_url = None
-if summarization_mode == "External API":
-    external_api_url = st.sidebar.text_input(
-        "External API Endpoint:",
-        value="https://ai-pdf-summarize.streamlit.app/summarize",
-        help="Enter the public API endpoint for summarization. Must accept a PDF file and return a summary."
+enable_evaluation = st.sidebar.checkbox("Enable Reference-based Evaluation", value=True)
+
+st.sidebar.markdown("---")
+if st.sidebar.button("Run Dataset Evaluation Mode"):
+    st.sidebar.info(
+        "Dataset evaluation mode is planned for future phases. Currently focusing on single PDF analysis."
     )
-
-st.sidebar.markdown("---")
-
-st.sidebar.markdown("### 📋 Enhanced Features")
-st.sidebar.markdown("• **Advanced PDF Text Extraction** - Extract from any PDF type")
-st.sidebar.markdown("• **Smart OCR Fallback** - Handle scanned/image-based PDFs")
-st.sidebar.markdown("• **Chunked AI Summarization** - Process documents of any size")
-st.sidebar.markdown("• **Detail Preservation** - Maintain comprehensive content coverage")
-st.sidebar.markdown("• **Smart Bullet Points** - Clean, organized summary format")
-st.sidebar.markdown("• **Document Analytics** - Detailed statistics and metrics")
-st.sidebar.markdown("• **Enhanced Downloads** - Comprehensive summary reports")
-st.sidebar.markdown("---")
-st.sidebar.markdown("### 🛠️ Technology Stack")
-st.sidebar.markdown("• **Streamlit** - Web interface")
-st.sidebar.markdown("• **PyMuPDF** - PDF processing")
-st.sidebar.markdown("• **Tesseract OCR** - Image text extraction")
-st.sidebar.markdown("• **pdf2image** - PDF to image conversion")
-st.sidebar.markdown("• **Transformers** - AI summarization")
-st.sidebar.markdown("• **T5-Small Model** - Natural language processing")
-st.sidebar.markdown("---")
-st.sidebar.markdown("👨‍💻 *Crafted with ❤️ by Manan Vyas*")
 
 # Main title
-st.title("📄 AI PDF Summarizer")
-st.subheader("Upload your PDF and get instant AI summaries!")
-st.caption("💡 Tip: This app works with both text-based and scanned PDFs. OCR will automatically activate for image-based documents.")
-st.warning("⚠️ Note: This summarizer may provide less comprehensive summaries than desired because it currently uses a small model. API integration with more powerful models is coming soon — stay tuned!")
+st.title("📄 Scientific Research Paper Summarizer")
+st.subheader("Fast Extractive and Abstractive Summarization (TextRank, Fast T5, PEGASUS)")
 
-# Add some spacing
-st.markdown("<br>", unsafe_allow_html=True)
+# File uploader
+st.markdown("### STEP 1 — Upload Research Paper")
+uploaded_file = st.file_uploader("Choose a PDF file (up to 50 MB)", type="pdf")
 
-# File uploader section in expandable container
-with st.expander("📤 Upload Your PDF", expanded=True):
-    uploaded_file = st.file_uploader(
-        "**Choose a PDF file**",
-        type="pdf",
-        help="Select a PDF file to extract text and generate summaries"
-    )
-    st.info("📌 **Supported formats:** PDF files (.pdf) - Both text-based and scanned/image-based PDFs supported with OCR fallback")
-
-# Process uploaded file
-if uploaded_file is not None:
-    try:
-        # Read the PDF file
-        pdf_bytes = uploaded_file.read()
-        
-        # Open PDF with PyMuPDF
-        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
-        
-        # Extract text from all pages (Primary method)
-        full_text = ""
-        for page_num in range(pdf_document.page_count):
-            page = pdf_document[page_num]  # Updated API method
-            full_text += page.get_text()
-        
-        # Store page count before closing document
-        total_pages = pdf_document.page_count
-          # Close the PDF document
-        pdf_document.close()
-        
-        # OCR Fallback for image-based/scanned PDFs
-        ocr_used = False
-        if not full_text.strip():
-            if check_tesseract():
-                st.warning("⚠️ No extractable text found — attempting OCR fallback for scanned/image-based PDF.")
-                
-                try:
-                    with st.spinner("🔍 Running OCR on scanned pages... This may take a moment."):
-                        # Convert PDF pages to images
-                        uploaded_file.seek(0)  # Reset file pointer
-                        pdf_bytes = uploaded_file.read()
-                        images = convert_from_bytes(pdf_bytes)
-                        
-                        # Extract text using OCR
-                        full_text = ""
-                        for i, image in enumerate(images):
-                            st.progress((i + 1) / len(images), text=f"Processing page {i + 1}/{len(images)}")
-                            page_text = pytesseract.image_to_string(image)
-                            full_text += page_text + "\n"
-                        
-                        ocr_used = True
-                        st.success(f"✅ OCR completed! Extracted text from {len(images)} page(s).")
-                        
-                except Exception as ocr_error:
-                    st.error(f"❌ OCR processing failed: {str(ocr_error)}")
-                    st.info("Please ensure the PDF contains readable text or images.")
-                    full_text = ""
-            else:
-                st.error("❌ No extractable text found and OCR is not available.")
-                st.info("📋 **To enable OCR support:**\n- Install Tesseract OCR binary\n- Windows: Download from GitHub releases\n- Linux/Mac: Use package manager (apt/brew)")
-                full_text = ""
-        
-        # Check if text was extracted
-        if full_text.strip():
-            # Extracted Preview Section
-            with st.expander("🔍 Extracted Preview (First 1000 Characters)", expanded=True):
-                if ocr_used:
-                    st.markdown("### 📖 Document Text Preview (OCR Extracted)")
-                    st.info("ℹ️ **Note:** Text was extracted using OCR. Accuracy may vary based on image quality.")
-                else:
-                    st.markdown("### 📖 Document Text Preview")
-                
-                # Show preview (first 1000 characters)
-                preview_text = full_text[:1000]
-                if len(full_text) > 1000:
-                    preview_text += "..."
-                  # Display the preview in a text area for better formatting
-                st.text_area(
-                    "Text Preview:",
-                    preview_text,
-                    height=300,
-                    disabled=True
-                )
-                
-                # Show document statistics
-                st.markdown("---")
-                st.markdown("### 📊 Document Statistics")
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    st.metric("**Total Pages**", total_pages)
-                
-                with col2:
-                    st.metric("**Total Characters**", len(full_text))
-                
-                with col3:
-                    st.metric("**Total Words**", len(full_text.split()))
-                    
-            # AI Summarization Section
-            with st.expander("🧠 AI-Generated Summary", expanded=True):
-                st.markdown("### 🤖 Generate AI Summary")
-                
-                # Show document processing information
-                word_count = len(full_text.split())
-                char_count = len(full_text)
-                estimated_chunks = max(1, char_count // 1000)
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.info(f"📊 **Document Size:** {word_count:,} words, {char_count:,} characters")
-                with col2:
-                    st.info(f"🧩 **Processing:** Will be divided into ~{estimated_chunks} chunks for comprehensive analysis")
-                
-                if ocr_used:
-                    st.warning("⚠️ **OCR Note:** Text was extracted using OCR. Summary quality depends on OCR accuracy.")
-                  # Summary length selection
-                st.markdown("### ⚙️ Enhanced Summary Settings")
-                summary_detail = st.select_slider(
-                    "Choose summary detail level:",
-                    options=["Brief", "Detailed", "Comprehensive"],
-                    value="Detailed",
-                    help="Brief: ~5-8 key points | Detailed: ~10-15 points | Comprehensive: ~15-25+ points with maximum detail preservation"
-                )
-                
-                # Show what each level provides
-                detail_info = {
-                    "Brief": "🎯 **Brief**: Captures main themes and key conclusions (fastest processing)",
-                    "Detailed": "📋 **Detailed**: Balanced coverage of important points and supporting details",
-                    "Comprehensive": "📚 **Comprehensive**: Maximum detail retention with extensive coverage of all topics"
-                }
-                st.info(detail_info[summary_detail])
-                
-                # Summarize button
-                if summarization_mode == "External API" and external_api_url:
-                    if st.button("🌐 Generate Summary via External API", type="primary", use_container_width=True):
-                        import requests
-                        try:
-                            with st.spinner("Sending PDF to external API for summarization..."):
-                                files = {"file": (uploaded_file.name, uploaded_file, "application/pdf")}
-                                data = {"model_name": model_choice, "max_length": 150, "min_length": 40}
-                                response = requests.post(external_api_url, files=files, data=data, timeout=60)
-                                if response.status_code == 200:
-                                    summary = response.json().get("summary", "No summary returned.")
-                                    st.success("Summary from external API:")
-                                    st.write(summary)
-                                else:
-                                    st.error(f"API Error: {response.status_code} {response.text}")
-                        except Exception as e:
-                            st.error(f"Failed to connect to external API: {str(e)}")
-                else:
-                    if st.button("🧠 Generate Comprehensive Summary", type="primary", use_container_width=True):
-                        try:
-                            # Show loading spinner with progress
-                            with st.spinner("🔄 Generating comprehensive AI summary... This may take a moment for large documents."):
-                                # Load the summarizer model with selected model
-                                summarizer = load_summarizer(model_choice)
-                                
-                                # Progress bar
-                                progress_bar = st.progress(0)
-                                status_text = st.empty()
-                              # Update progress: Starting
-                            progress_bar.progress(10)
-                            status_text.text("📝 Analyzing document structure...")
-                            
-                            # Store progress components in session state for chunk processing
-                            st.session_state['progress_bar'] = progress_bar.progress
-                            st.session_state['status_text'] = status_text.text
-                            
-                            # Generate chunked summary with dynamic chunk sizing
-                            # Smaller chunks for more detailed summaries
-                            if summary_detail == "Brief":
-                                chunk_size = 2000  # Larger chunks, fewer summaries
-                            elif summary_detail == "Detailed":
-                                chunk_size = 1500   # Medium chunks, balanced
-                            else:  # Comprehensive
-                                chunk_size = 1000   # Smaller chunks, more detailed coverage
-                            
-                            progress_bar.progress(30)
-                            status_text.text("🧩 Breaking document into optimal chunks...")
-                            
-                            # Get comprehensive summary with detail level
-                            comprehensive_summary = summarize_chunked_text(full_text, summarizer, chunk_size, summary_detail)
-                            
-                            progress_bar.progress(80)
-                            status_text.text("✨ Formatting final summary...")
-                            
-                            # Format into bullet points
-                            bullet_points = format_summary_bullets(comprehensive_summary)
-                            
-                            progress_bar.progress(100)
-                            status_text.text("✅ Summary complete!")
-                            
-                            # Clear progress indicators
-                            progress_bar.empty()
-                            status_text.empty()
-                            
-                            # Display the summary result with enhanced formatting
-                            with st.container():
-                                # Add divider for visual separation
-                                st.markdown("---")
-                                
-                                # Header for summary section
-                                st.markdown("### 📝 Comprehensive Summary Results")
-                                
-                                # Summary statistics
-                                col1, col2, col3 = st.columns(3)
-                                with col1:
-                                    st.metric("📊 Summary Points", len(bullet_points))
-                                with col2:
-                                    compression_ratio = len(full_text) // max(len(comprehensive_summary), 1)
-                                    st.metric("🔄 Compression Ratio", f"{compression_ratio}:1")
-                                with col3:
-                                    st.metric("🤖 Model Used", model_choice.split('/')[-1])
-                                
-                                # Additional metrics row
-                                col4, col5, col6 = st.columns(3)
-                                with col4:
-                                    st.metric("📝 Summary Length", f"{len(comprehensive_summary)} chars")
-                                with col5:
-                                    st.metric("📄 Original Length", f"{len(full_text)} chars")
-                                with col6:
-                                    coverage_percent = min(100, (len(comprehensive_summary) / len(full_text)) * compression_ratio * 10)
-                                    st.metric("📈 Content Coverage", f"{coverage_percent:.1f}%")
-                                
-                                st.markdown("---")
-                                
-                                # Display bullet points in styled container
-                                if bullet_points:
-                                    bullet_points_html = ""
-                                    for i, point in enumerate(bullet_points, 1):
-                                        bullet_points_html += f"<div style='margin-bottom: 8px;'><strong>{i}.</strong> {point}</div>"
-                                    
-                                    st.markdown(
-                                        f"""
-                                        <div style="background-color:#f0f2f6; padding: 20px; border-radius: 10px; margin: 15px 0; border-left: 4px solid #4CAF50;">
-                                            <div style="color: #333; line-height: 1.8; font-size: 16px;">
-                                                {bullet_points_html}
-                                            </div>
-                                        </div>
-                                        """, 
-                                        unsafe_allow_html=True
-                                    )
-                                else:
-                                    st.error("❌ Could not generate meaningful bullet points from the summary.")
-                                    # Fallback: show raw summary
-                                    st.text_area("Raw Summary:", comprehensive_summary, height=200)
-                                
-                                # Add success indicator
-                                st.success(f"✅ Comprehensive summary generated successfully! ({len(bullet_points)} key points extracted)")
-                                
-                                # Download section
-                                st.markdown("---")
-                                st.markdown("### 📥 Download Summary")
-                                
-                                # Optional: Allow users to customize filename
-                                col1, col2 = st.columns([2, 1])
-                                with col1:
-                                    filename = st.text_input(
-                                        "Customize filename (optional):",
-                                        value="comprehensive_summary",
-                                        help="Enter filename without extension (.txt will be added automatically)"
-                                    )
-                                
-                                with col2:
-                                    st.markdown("<br>", unsafe_allow_html=True)  # Add spacing for alignment
-                                    # Create downloadable content - convert bullet points to plain text
-                                    compression_ratio = len(full_text) // max(len(comprehensive_summary), 1)
-                                    coverage_percent = min(100, (len(comprehensive_summary) / len(full_text)) * compression_ratio * 10)
-                                    
-                                    download_content = f"""AI PDF Comprehensive Summary - Enhanced Analysis
-{'='*70}
-
-Generated on: {st.session_state.get('current_date', 'Today')}
-Document: {uploaded_file.name}
-AI Model: {model_choice}
-Summary Detail Level: {summary_detail}
-Processing Method: Chunked Summarization with Enhanced Detail Preservation
-
-Document Analysis:
-- Total Pages: {total_pages}
-- Total Words: {word_count:,}
-- Total Characters: {char_count:,}
-- Estimated Reading Time: {word_count // 200} minutes
-
-Summary Statistics:
-- Summary Points Extracted: {len(bullet_points)}
-- Summary Length: {len(comprehensive_summary):,} characters
-- Compression Ratio: {compression_ratio}:1
-- Content Coverage: {coverage_percent:.1f}%
-- Chunks Processed: ~{max(1, char_count // chunk_size)}
-
-COMPREHENSIVE SUMMARY:
-{'-'*50}
-"""
-                                    
-                                    # Convert bullet points back to clean text for download
-                                    for i, point in enumerate(bullet_points, 1):
-                                        download_content += f"{i}. {point}\n\n"
-                                    
-                                    # Add the full summary text as well
-                                    download_content += f"""
-
-FULL SUMMARY TEXT:
-{'-'*50}
-{comprehensive_summary}
-
-{'-'*70}
-Generated by AI PDF Summarizer v3.0 - Stage 9 Enhanced
-Advanced Chunked Summarization with Detail Preservation
-"""
-                                    
-                                    # Download button
-                                    st.download_button(
-                                        label="📥 Download Comprehensive Summary",
-                                        data=download_content,
-                                        file_name=f"{filename}.txt",
-                                        mime="text/plain",
-                                        type="secondary",
-                                        use_container_width=True
-                                    )
-                                
-                                st.caption("💡 This comprehensive summary covers the entire document, not just the first 1000 characters.")
-                        except Exception as e:
-                            st.error(f"❌ Error generating summary: {str(e)}")
-                            st.info("Please try again or try with a different model. For very large documents, processing may take longer.")
-            
-        else:
-            st.error("❌ No text could be extracted from this PDF using either direct extraction or OCR.")
-            st.info("🔧 **Possible reasons:**\n- The PDF contains only non-text images\n- The image quality is too poor for OCR\n- The PDF is corrupted or password-protected\n- OCR dependencies may not be properly installed")
-            
-    except Exception as e:
-        st.error(f"❌ Error processing PDF: {str(e)}")
-        st.info("Please make sure you've uploaded a valid PDF file and that all dependencies are installed.")
-
+if uploaded_file is None:
+    st.session_state.pop("active_file_hash", None)
+    _reset_summary_state()
 else:
-    # Show instructions when no file is uploaded
-    with st.container():
-        st.info("👆 Please upload a PDF file to get started!")
-        
-        # Add helpful information in organized sections
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.markdown("### ℹ️ How to Use")
-            st.markdown("""            1. **📤 Upload a PDF file** using the file uploader above
-            2. **🔍 View the extracted text** preview to ensure proper text extraction
-            3. **🧠 Click "Generate Comprehensive Summary"** to get an AI-generated summary instantly!
-            """)
-        
-        with col2:
-            st.markdown("### 📋 Supported Formats")
-            st.markdown("""
-            • **PDF files (.pdf)** - Primary format
-            • **Text-based PDFs** - Direct text extraction
-            • **Scanned/Image PDFs** - OCR text extraction
-            • **Mixed content PDFs** - Automatic detection & processing
-            • **Password-protected** - Not currently supported
-            """)
-          # Additional tips section
-        st.markdown("---")
-        st.markdown("### 💡 Tips for Best Results")
-        st.markdown("""
-        - **Text-based PDFs**: Fastest processing with highest accuracy
-        - **Scanned PDFs**: OCR will activate automatically (may take longer)
-        - **Image quality**: Higher resolution scans produce better OCR results
-        - **Document size**: Smaller documents process faster
-        - **Mixed PDFs**: App automatically detects and uses best extraction method
-        - **Complex layouts**: May require manual review of extracted text
-        """)
+    pdf_bytes = uploaded_file.getvalue()
+    file_size_mb = len(pdf_bytes) / (1024 * 1024)
+    effective_max_pages = int(max_pages_limit) if max_pages_limit > 0 else None
+    file_hash = hashlib.sha256(pdf_bytes).hexdigest() + f":{effective_max_pages}"
 
-# Footer
-st.markdown("---")
-st.markdown(
-    """    <div style='text-align: center; color: #666; font-size: 14px; margin-top: 50px;'>
-        <p>🚀 <strong>AI PDF Summarizer v3.0</strong> | Enhanced with Chunked Summarization | Built with ❤️ using Streamlit</p>
-        <p>📧 Questions or feedback? Reach out to <strong>Manan Vyas</strong></p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+    if st.session_state.get("active_file_hash") != file_hash:
+        st.session_state["active_file_hash"] = file_hash
+        _reset_summary_state()
+
+    with st.spinner("Extracting & caching PDF text..."):
+        raw_text, cleaned_text, sections, total_pages, ocr_used, error_msg = process_pdf_cached(
+            file_hash, pdf_bytes, effective_max_pages
+        )
+
+    if error_msg:
+        st.error(error_msg)
+    elif not cleaned_text.strip():
+        st.error("No text could be extracted from the uploaded PDF.")
+    else:
+        st.success(f"PDF ready ({file_size_mb:.2f} MB) — cached for instant interactions!")
+        if ocr_used:
+            st.info("OCR was used for scanned pages.")
+
+        summarization_text = (
+            remove_references_section(cleaned_text) if exclude_references else cleaned_text
+        )
+
+        # STEP 2
+        st.markdown("### STEP 2 — Document Information")
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("File name", uploaded_file.name)
+        col2.metric("Total Pages", total_pages)
+        col3.metric("Word Count", len(cleaned_text.split()))
+        col4.metric("Summarizable Words", len(summarization_text.split()))
+
+        st.markdown("**Detected Sections:**")
+        if sections:
+            st.write(", ".join(sections.keys()))
+        else:
+            st.write("No standard sections detected. Treating as full text.")
+
+        # STEP 3
+        with st.expander("STEP 3 — Extracted Content Preview"):
+            preview = cleaned_text[:2000] + ("..." if len(cleaned_text) > 2000 else "")
+            st.text_area("Cleaned Text (First 2000 chars)", preview, height=200)
+
+        # Generate Summaries
+        if st.button("Generate Summaries", type="primary"):
+            _reset_summary_state()
+            st.session_state["last_model_label"] = model_choice
+
+            # TextRank
+            try:
+                with st.spinner("Generating TextRank extractive summary..."):
+                    start_time = time.time()
+                    textrank_summary = generate_textrank_summary(
+                        summarization_text, num_sentences=num_sentences
+                    )
+                    st.session_state["textrank_summary"] = textrank_summary
+                    st.session_state["textrank_time"] = time.time() - start_time
+            except Exception as e:
+                st.error(f"TextRank error: {e}")
+                st.session_state["textrank_summary"] = "TextRank summarization failed."
+                st.session_state["textrank_time"] = 0.0
+
+            # Abstractive Model (or instant skip when TextRank-only selected)
+            if model_choice == "textrank":
+                st.session_state["device"] = "CPU"
+                st.session_state["pegasus_summary"] = (
+                    "Skipped (TextRank-Only fast mode selected). Choose an AI model in the sidebar for abstractive summarization."
+                )
+                st.session_state["pegasus_time"] = 0.0
+                st.session_state["section_summaries"] = {}
+            else:
+                model = None
+                tokenizer = None
+                try:
+                    with st.spinner(f"Loading model ({model_choice})..."):
+                        model, tokenizer = get_cached_model(model_choice)
+                        device = "CUDA" if next(model.parameters()).device.type == "cuda" else "CPU"
+                        st.session_state["device"] = device
+
+                    with st.spinner("Generating abstractive summary..."):
+                        pbar = st.progress(0, text="Processing chunks...")
+                        start_time = time.time()
+                        pegasus_summary = generate_pegasus_summary(
+                            summarization_text,
+                            model,
+                            tokenizer,
+                            max_length=pegasus_max_length,
+                            min_length=pegasus_min_length,
+                            num_beams=speed_cfg["num_beams"],
+                            max_chunks=speed_cfg["max_chunks"],
+                            progress_callback=lambda pct: pbar.progress(pct, text=f"Processing chunks... {pct}%"),
+                        )
+                        pbar.empty()
+                        st.session_state["pegasus_summary"] = pegasus_summary
+                        st.session_state["pegasus_time"] = time.time() - start_time
+                except Exception as e:
+                    st.error(f"Abstractive summarization error: {e}")
+                    st.session_state["pegasus_summary"] = "Abstractive summarization failed."
+                    st.session_state["pegasus_time"] = 0.0
+
+                # Section-wise
+                st.session_state["section_summaries"] = {}
+                if (
+                    enable_section_wise
+                    and sections
+                    and model is not None
+                    and st.session_state.get("pegasus_summary") != "Abstractive summarization failed."
+                ):
+                    try:
+                        with st.spinner("Generating section-wise summaries..."):
+                            for sec_name, sec_text in sections.items():
+                                if sec_name in ["Abstract", "Introduction", "Methodology", "Results", "Conclusion"]:
+                                    sec_sum = generate_pegasus_summary(
+                                        sec_text,
+                                        model,
+                                        tokenizer,
+                                        max_length=150,
+                                        min_length=30,
+                                        num_beams=speed_cfg["num_beams"],
+                                        max_chunks=3,
+                                    )
+                                    st.session_state["section_summaries"][sec_name] = sec_sum
+                    except Exception as e:
+                        st.warning(f"Section-wise summarization failed: {e}")
+
+            st.session_state["summary_generated"] = True
+
+        if st.session_state.get("summary_generated", False):
+            tr_summary = st.session_state.get("textrank_summary", "")
+            pg_summary = st.session_state.get("pegasus_summary", "")
+            tr_time = st.session_state.get("textrank_time", 0.0)
+            pg_time = st.session_state.get("pegasus_time", 0.0)
+            used_model = st.session_state.get("last_model_label", model_choice)
+
+            # STEP 4
+            st.markdown("### STEP 4 — TextRank Baseline")
+            if tr_summary:
+                st.info(tr_summary)
+
+            # STEP 5
+            st.markdown("### STEP 5 — Abstractive Summary")
+            st.caption(f"Model: {used_model} | Device: {st.session_state.get('device', 'CPU')}")
+            if pg_summary:
+                st.success(pg_summary)
+
+            # STEP 6
+            if enable_section_wise and st.session_state.get("section_summaries"):
+                st.markdown("### STEP 6 — Section-wise Summary")
+                for sec_name, sec_sum in st.session_state["section_summaries"].items():
+                    st.markdown(f"#### {sec_name} Summary")
+                    st.write(sec_sum)
+
+            # STEP 7
+            rouge_scores_tr = st.session_state.get("rouge_scores_tr") or {
+                "rouge1": "N/A",
+                "rouge2": "N/A",
+                "rougeL": "N/A",
+            }
+            rouge_scores_pg = st.session_state.get("rouge_scores_pg") or {
+                "rouge1": "N/A",
+                "rouge2": "N/A",
+                "rougeL": "N/A",
+            }
+
+            if enable_evaluation:
+                st.markdown("### STEP 7 — Evaluation")
+                st.markdown("**Reference-based evaluation**")
+                reference_summary = st.text_area(
+                    "Paste Reference Summary (e.g., ground-truth Abstract) here to calculate ROUGE:"
+                )
+                if st.button("Calculate ROUGE"):
+                    if reference_summary.strip():
+                        rouge_scores_tr = calculate_rouge([tr_summary], [reference_summary])
+                        st.session_state["rouge_scores_tr"] = rouge_scores_tr
+
+                        if used_model != "textrank" and pg_summary != "Abstractive summarization failed.":
+                            rouge_scores_pg = calculate_rouge([pg_summary], [reference_summary])
+                        else:
+                            rouge_scores_pg = {"rouge1": "N/A", "rouge2": "N/A", "rougeL": "N/A"}
+                        st.session_state["rouge_scores_pg"] = rouge_scores_pg
+                        st.success("ROUGE scores calculated locally (0 network calls)!")
+                    else:
+                        st.warning("Please provide a reference summary.")
+
+            # STEP 8
+            st.markdown("### STEP 8 — Model Comparison")
+
+            tr_len = len(tr_summary.split())
+            pg_len = len(pg_summary.split())
+            tr_sents = count_sentences(tr_summary)
+            pg_sents = count_sentences(pg_summary)
+
+            def _fmt_rouge(val) -> str:
+                return f"{val:.4f}" if isinstance(val, (int, float)) else "N/A"
+
+            tr_rouge1 = _fmt_rouge(rouge_scores_tr.get("rouge1"))
+            tr_rouge2 = _fmt_rouge(rouge_scores_tr.get("rouge2"))
+            tr_rougeL = _fmt_rouge(rouge_scores_tr.get("rougeL"))
+            pg_rouge1 = _fmt_rouge(rouge_scores_pg.get("rouge1"))
+            pg_rouge2 = _fmt_rouge(rouge_scores_pg.get("rouge2"))
+            pg_rougeL = _fmt_rouge(rouge_scores_pg.get("rougeL"))
+
+            comparison_data = {
+                "Model": ["TextRank", f"Abstractive ({used_model})"],
+                "Summary Length (words)": [tr_len, pg_len],
+                "Number of sentences": [tr_sents, pg_sents],
+                "ROUGE-1": [tr_rouge1, pg_rouge1],
+                "ROUGE-2": [tr_rouge2, pg_rouge2],
+                "ROUGE-L": [tr_rougeL, pg_rougeL],
+                "Processing Time (s)": [f"{tr_time:.2f}", f"{pg_time:.2f}"],
+            }
+            st.table(pd.DataFrame(comparison_data))
+
+            # Build full report and provide direct download links + buttons
+            report_content = build_analysis_report(
+                paper_name=uploaded_file.name,
+                model_used=used_model,
+                total_pages=total_pages,
+                word_count=len(cleaned_text.split()),
+                detected_sections=list(sections.keys()),
+                textrank_summary=tr_summary,
+                textrank_time=tr_time,
+                abstractive_summary=pg_summary,
+                abstractive_time=pg_time,
+                section_summaries=st.session_state.get("section_summaries") if enable_section_wise else None,
+                rouge_tr=rouge_scores_tr,
+                rouge_pg=rouge_scores_pg,
+            )
+
+            base_stem = Path(uploaded_file.name).stem
+            report_filename = f"{base_stem}_summary_report.txt"
+
+            st.markdown("### Direct Download Link & Report Downloads")
+            st.markdown(
+                _direct_download_link(report_content, report_filename, f"Direct Download: {report_filename}"),
+                unsafe_allow_html=True,
+            )
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.download_button(
+                    "Download TextRank Summary",
+                    tr_summary,
+                    file_name=f"{base_stem}_textrank_summary.txt",
+                )
+            with col2:
+                st.download_button(
+                    "Download Abstractive Summary",
+                    pg_summary,
+                    file_name=f"{base_stem}_abstractive_summary.txt",
+                )
+            with col3:
+                st.download_button(
+                    "Download Full Analysis Report",
+                    report_content,
+                    file_name=report_filename,
+                )

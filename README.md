@@ -1,30 +1,42 @@
-# 📄 AI PDF Summarizer with LLMs
+# 📄 Scientific Research Paper Summarizer
 
-A powerful web application that extracts text from PDF documents and generates AI-powered summaries using state-of-the-art language models. Built with Streamlit for an intuitive user experience.
+A powerful web application designed specifically for academic and scientific research paper summarization. It combines the strengths of extractive summarization (TextRank) and abstractive summarization (PEGASUS) to provide comprehensive document analysis.
+
+## 🎯 Problem Statement & Motivation
+
+Scientific papers are often lengthy and dense, making it difficult to quickly extract the core methodology, results, and conclusions. This tool bridges that gap by offering:
+- **Baseline Extractive Summary**: Using TextRank to highlight the most critical sentences directly from the text.
+- **Proposed Abstractive Summary**: Using the state-of-the-art PEGASUS model fine-tuned on scientific datasets (arXiv / PubMed) to generate human-like abstracts.
+- **Section-wise Analysis**: Heuristic extraction and summarization of key sections (Abstract, Introduction, Methodology, Results, Conclusion).
+
+*Note: PEGASUS is used as a pretrained/fine-tuned scientific summarization model from Hugging Face. We do not claim to have trained it from scratch.*
 
 ## ✨ Features
 
-- 📤 **Upload PDF documents** - Support for both text-based and scanned PDF files
-- 🔍 **Smart text extraction** - Direct extraction for text-based PDFs
-- 🔍 **OCR fallback support** - Automatic OCR for scanned/image-based PDFs
-- 🧠 **Summarize using Hugging Face models** - Choose from T5, BART, Pegasus, DistilBART, and more
-- 📌 **Summary displayed as clean bullet points** - Easy-to-read format
-- 📥 **Download the summary as a `.txt` file** - Save for future reference
-- 🖼️ **Polished UI with emoji icons and clear sectioning** - Modern, user-friendly interface
-- 📊 **Document statistics** - View page count, word count, and character count
-- 🎯 **Expandable sections** - Organized workflow with collapsible panels
-- 🔄 **Real-time processing** - Instant text extraction and summarization
-- ⚡ **Automatic detection** - Intelligently chooses best extraction method
+- 📤 **Upload Research Papers** (PDF format)
+- 🔍 **Smart Text Extraction** (PyMuPDF with Tesseract OCR fallback)
+- 🧩 **Long-Document Chunking** (Tokenizer-aware chunking to handle papers that exceed model limits)
+- 🧠 **PEGASUS Abstractive Summarization** (`google/pegasus-arxiv` or `google/pegasus-pubmed`)
+- 📊 **TextRank Extractive Baseline** (Sentence-scoring baseline via `sumy`)
+- 📑 **Scientific Section Detection** (Heuristic detection of common academic headings)
+- 📈 **Reference-based Evaluation** (Calculate ROUGE-1, ROUGE-2, ROUGE-L against user-provided reference summaries)
+- 📥 **Download Comprehensive Analysis Reports**
 
-## 🛠️ Tech Stack
+## 🏗️ Architecture
 
-- [Streamlit](https://streamlit.io/) – UI framework for building interactive web apps
-- [PyMuPDF (fitz)](https://pymupdf.readthedocs.io/en/latest/) – PDF text extraction and processing
-- [Hugging Face Transformers](https://huggingface.co/docs/transformers/index) – AI summarization models
-- [Torch](https://pytorch.org/) – Backend for transformer models
-- [Python](https://python.org/) – Core programming language
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) – Optical character recognition for scanned PDFs
-- [pdf2image](https://github.com/Belval/pdf2image) – PDF to image conversion for OCR processing
+```mermaid
+graph TD
+    A[Upload PDF] --> B[PDF Extractor]
+    B --> C[Text Cleaner]
+    C --> D[Section Detector]
+    C --> E[TextRank Extractive Baseline]
+    C --> F[Tokenizer Chunking]
+    F --> G[PEGASUS Abstractive Summarizer]
+    D --> G
+    E --> H[UI Display & Report]
+    G --> H
+    H --> I[ROUGE Evaluation]
+```
 
 ## 🚀 Setup Instructions
 
@@ -37,7 +49,10 @@ A powerful web application that extracts text from PDF documents and generates A
 2. **Create virtual environment & activate it (optional but recommended):**
    ```bash
    python -m venv .venv
-   source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+   # Windows
+   .venv\Scripts\activate
+   # Linux/Mac
+   source .venv/bin/activate
    ```
 
 3. **Install dependencies:**
@@ -46,161 +61,60 @@ A powerful web application that extracts text from PDF documents and generates A
    ```
 
 4. **Install Tesseract OCR (for scanned PDF support):**
-   
-   **Windows:**
-   - Download from [GitHub Releases](https://github.com/tesseract-ocr/tesseract/releases)
-   - Add to PATH environment variable
-   
-   **Linux:**
-   ```bash
-   sudo apt-get install tesseract-ocr poppler-utils
-   ```
-   
-   **macOS:**
-   ```bash
-   brew install tesseract poppler
-   ```
+   - **Windows:** Download from [GitHub Releases](https://github.com/tesseract-ocr/tesseract/releases) and add to PATH.
+   - **Linux:** `sudo apt-get install tesseract-ocr poppler-utils`
+   - **macOS:** `brew install tesseract poppler`
 
-5. **Run the app:**
+5. **Run the application:**
    ```bash
    streamlit run app.py
    ```
 
-6. **Open your browser** and navigate to `http://localhost:8501`
-
-## 🌐 Live Demo
-
-[🚀 Try the AI PDF Summarizer Live!](https://ai-pdf-summarize.streamlit.app/)
-
-You can use the app directly in your browser—no installation required!
-
-## 🖼️ Screenshot
-
-
-![App Screenshot](ScreenShot.png)
-
-
-
 ## 📚 How to Use
 
-1. **Upload Your PDF**: Click on the "📤 Upload Your PDF" section and select a text-based PDF file
-2. **Preview Text**: Review the extracted text in the "🔍 Extracted Preview" section
-3. **Generate Summary**: Click the "🧠 Summarize Text" button in the "🧠 AI-Generated Summary" section
-4. **Download**: Use the "📥 Download Summary" button to save your summary as a .txt file
+1. **Configure Model**: Open the sidebar and select the PEGASUS model (arXiv or PubMed).
+2. **Upload PDF**: Upload a scientific paper.
+3. **Generate Summaries**: Click "Generate Summaries". The app will chunk the text, run TextRank, and run PEGASUS.
+4. **Evaluate (Optional)**: Paste the original abstract into the Evaluation text area and click "Calculate ROUGE".
+5. **Download Report**: Click "Download Analysis Report" to get a `.txt` file containing the summaries and evaluation metrics.
 
 ## 🎯 Project Structure
 
-```
-ai-pdf-summarizer/
+```text
+scientific-paper-summarizer/
 ├── app.py                 # Main Streamlit application
-├── api.py                 # api manager to user their model for faster perfromance
+├── api.py                 # FastAPI endpoints
 ├── requirements.txt       # Project dependencies
-├── .gitignore            # Git ignore rules
-├── README.md             # Project documentation
-└── screenshot.png        # UI screenshot (to be added)
+├── README.md              # Project documentation
+├── utils/                 # Modular utilities
+│   ├── pdf_extractor.py   # PyMuPDF and OCR text extraction
+│   ├── text_cleaner.py    # Text formatting and cleaning
+│   ├── section_detector.py# Heuristic section detection
+│   ├── text_chunker.py    # Tokenizer-aware chunking for LLMs
+│   ├── textrank.py        # Extractive baseline summarization
+│   ├── pegasus.py         # Abstractive summarization logic
+│   └── evaluation.py      # ROUGE metrics calculation
 ```
 
-## 🤖 AI Model Information
+## 📊 Evaluation Methodology
 
-This project supports a wide range of Hugging Face summarization models:
+This project utilizes the Hugging Face `evaluate` library to compute ROUGE scores. Since generating intrinsic evaluations without a reference is flawed, we explicitly require a **reference summary** (e.g., the paper's original abstract) to compute ROUGE-1, ROUGE-2, and ROUGE-L.
 
-- **T5 Family**: `t5-small`, `t5-base`, `t5-large`
-- **BART Family**: `facebook/bart-large-cnn`, `sshleifer/distilbart-cnn-12-6`, `philschmid/bart-large-cnn-samsum`
-- **Pegasus Family**: `google/pegasus-xsum`, `google/pegasus-cnn_dailymail`, `google/pegasus-multi_news`, `google/pegasus-pubmed`, `google/pegasus-arxiv`
+## ⚠️ Limitations
 
-**Model selection is available in the sidebar.**
+- Section detection relies on common heading heuristics and may not perfectly detect sections in unconventionally formatted papers.
+- Very long PDFs (e.g., full books) might take a significant amount of time to summarize due to sequential chunk processing.
+- The OCR fallback depends on Tesseract accuracy, which drops significantly on low-quality scans.
 
-- **Task**: Text-to-text generation (summarization)
-- **Performance**: T5 is fast and efficient, BART and Pegasus provide higher quality for news and scientific text
-- **Caching**: Models are cached using Streamlit's `@st.cache_resource` for faster subsequent runs
+## 🌱 Future Improvements
 
-## 📋 Supported File Formats
-
-- ✅ **PDF files (.pdf)** - Primary format
-- ✅ **Text-based PDFs** - Work best for extraction
-- ✅ **Scanned PDFs** - OCR extraction available
-- ✅ **Image-based PDFs** - Automatic OCR fallback
-- ❌ **Password-protected PDFs** - Not currently supported
-
-## 💡 Tips for Best Results
-
-- **Text-based PDFs**: Fastest processing with highest accuracy
-- **Scanned PDFs**: OCR will activate automatically (may take longer)
-- **Image quality**: Higher resolution scans produce better OCR results
-- **Document size**: Smaller documents process faster
-- **Mixed PDFs**: App automatically detects and uses best extraction method
-- The AI summarizes the first 1000 characters for optimal performance
-- Complex technical documents may require manual review of summaries
-
-## 🔧 Development Stages
-
-This project was developed in multiple stages:
-
-- **Stage 1**: PDF upload and text extraction
-- **Stage 2**: AI summarization integration
-- **Stage 3**: Bullet-point summary formatting
-- **Stage 4**: Sidebar and polished layout
-- **Stage 5**: Summary download feature
-- **Stage 6**: Requirements and deployment setup
-- **Stage 7**: Documentation and README
-- **Stage 8**: OCR fallback support for scanned PDFs
-
-## 🛠️ API Usage
-
-You can use the REST API to summarize PDFs programmatically.
-
-### Endpoint
-
-`POST /summarize`
-
-### Parameters
-- `file`: PDF file (form-data)
-- `model_name`: (optional) Summarization model (default: t5-small)
-- `max_length`: (optional) Max summary length (default: 150)
-- `min_length`: (optional) Min summary length (default: 40)
-
-### Example (using curl)
-```bash
-curl -X POST "http://localhost:8000/summarize" \
-  -F "file=@yourfile.pdf" \
-  -F "model_name=t5-small" \
-  -F "max_length=150" \
-  -F "min_length=40"
-```
-
-### Response
-```json
-{
-  "summary": "..."
-}
-```
-
-## 🤝 Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request. For major changes, please open an issue first to discuss what you would like to change.
-
-## 📄 License
-
-This project is open source and available under the [MIT License](LICENSE).
-
-## 👨‍💻 Author
-
-**Manan Vyas**
-- GitHub: [@MananVyas01](https://github.com/MananVyas01)
-- Project: [AI PDF Summarizer](https://github.com/MananVyas01/ai-pdf-summarizer)
-
-## 🙏 Acknowledgments
-
-- [Streamlit](https://streamlit.io/) for the amazing web app framework
-- [Hugging Face](https://huggingface.co/) for providing a wide range of summarization models and the transformers library
-- [PyMuPDF](https://pymupdf.readthedocs.io/) for robust PDF processing capabilities
-- [Tesseract OCR](https://github.com/tesseract-ocr/tesseract) for image-based text extraction
-- [pdf2image](https://github.com/Belval/pdf2image) and [Poppler](https://poppler.freedesktop.org/) for PDF to image conversion
-- Model creators: Google (Pegasus), Facebook/Meta (BART), Hugging Face (T5, DistilBART), and the open-source community for their contributions to NLP research
+- Add batch processing support for full dataset evaluation (e.g., sampling 50 arXiv papers and aggregating ROUGE scores automatically).
+- Support open-source smaller models natively integrated with GPU acceleration for local inference.
+- Finer-grained chunk overlap to prevent context loss at chunk boundaries.
 
 ---
 
 <div align="center">
-  <p>🚀 <strong>AI PDF Summarizer v2.0</strong> | Built with ❤️ using Streamlit</p>
+  <p>🚀 <strong>Scientific Research Paper Summarizer</strong> | Built with ❤️ using Streamlit</p>
   <p>📧 Questions or feedback? Reach out to <strong>Manan Vyas</strong></p>
 </div>
